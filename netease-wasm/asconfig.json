@@ -1,0 +1,14 @@
+{
+  "targets": {
+    "release": {
+      "outFile": "netease.wasm",
+      "optimizeLevel": 3,
+      "shrinkLevel": 2,
+      "converge": true,
+      "noAssert": true
+    }
+  },
+  "options": {
+    "bindings": "esm"
+  }
+}

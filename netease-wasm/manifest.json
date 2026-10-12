@@ -1,0 +1,11 @@
+{
+  "id": "netease-wasm",
+  "name": "NetEase Lyrics Provider",
+  "author": "Lyria Community",
+  "version": "1.0.0",
+  "description": "Synchronized line-by-line and translated lyrics from NetEase Cloud Music",
+  "capabilities": ["lyrics"],
+  "priority": 9,
+  "main": "netease.wasm",
+  "icon": "lucide:music"
+}
