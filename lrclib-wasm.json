@@ -1,0 +1,11 @@
+{
+  "id": "lrclib-wasm.wasm",
+  "name": "LRCLIB Lyrics Provider",
+  "author": "Lyria Community",
+  "version": "1.0.0",
+  "description": "Synchronized line-by-line and plain text lyrics from LRCLIB",
+  "capabilities": ["lyrics"],
+  "priority": 10,
+  "main": "lrclib-wasm.wasm",
+  "icon": "lucide:file-text"
+}

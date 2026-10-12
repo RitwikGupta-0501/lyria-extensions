@@ -1,0 +1,16 @@
+{
+  "name": "lrclib-wasm",
+  "version": "1.0.0",
+  "description": "LRCLIB Lyrics Provider for Lyria",
+  "type": "module",
+  "scripts": {
+    "build": "asc assembly/index.ts --target release --outFile lrclib.wasm --use abort=assembly/index/myAbort -Ospeed --shrinkLevel 2 --noAssert"
+  },
+  "devDependencies": {
+    "assemblyscript": "^0.28.20",
+    "assemblyscript-json": "^1.1.0"
+  },
+  "dependencies": {
+    "@extism/as-pdk": "^1.0.0"
+  }
+}

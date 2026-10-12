@@ -1,4 +1,4 @@
-name: Build WASI Extensions
+name: Build & Release Extensions
 
 on:
   push:
@@ -8,152 +8,426 @@ on:
     branches: [ "main" ]
   workflow_dispatch:
     inputs:
+      force_all:
+        description: 'Force build all extensions regardless of git diff'
+        required: false
+        type: boolean
+        default: false
       tag_name:
         description: 'Release Tag (leave empty for "latest" or specify e.g. v1.0.0)'
         required: false
         default: 'latest'
 
+permissions:
+  contents: write
+
 jobs:
-  # Job 1: Auto-discover all Rust extensions
+  # Job 1: Discover extensions and detect which have received updates
   discover:
-    name: Discover Rust Extensions
+    name: Discover & Detect Changes
     runs-on: ubuntu-latest
     outputs:
-      matrix: ${{ steps.set-matrix.outputs.matrix }}
+      matrix: ${{ steps.diff-detector.outputs.matrix }}
+      has_changes: ${{ steps.diff-detector.outputs.has_changes }}
     steps:
-      - name: Checkout repository
+      - name: Checkout repository with full history
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-      - name: Find directories containing Cargo.toml
-        id: set-matrix
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - name: Detect Changed Extensions
+        id: diff-detector
+        shell: bash
         run: |
-          # Find subdirectories containing Cargo.toml at depth 2 (e.g., ./youtube-wasm/Cargo.toml)
-          DIRS=$(find . -maxdepth 2 -mindepth 2 -name "Cargo.toml" -exec dirname {} + \
-            | sed 's|^\./||' \
-            | jq -R -s -c 'split("\n") | map(select(length > 0))')
-          
-          echo "Found Rust extensions: $DIRS"
-          echo "matrix=$DIRS" >> "$GITHUB_OUTPUT"
+          python3 - << 'EOF'
+          import os, sys, json, subprocess
 
-  # Job 2: Build all discovered extensions in parallel
+          def run(cmd):
+              try:
+                  return subprocess.check_output(cmd, shell=True, text=True).strip()
+              except subprocess.CalledProcessError:
+                  return ""
+
+          # 1. Discover all valid extensions
+          discovered = []
+          for entry in sorted(os.listdir('.')):
+              if not os.path.isdir(entry) or entry.startswith('.'):
+                  continue
+              has_cargo = os.path.isfile(os.path.join(entry, 'Cargo.toml'))
+              has_as = os.path.isfile(os.path.join(entry, 'asconfig.json')) or (
+                  os.path.isfile(os.path.join(entry, 'package.json')) and
+                  os.path.isdir(os.path.join(entry, 'assembly'))
+              )
+              if has_cargo:
+                  discovered.append({'name': entry, 'type': 'rust', 'path': entry})
+              elif has_as:
+                  discovered.append({'name': entry, 'type': 'assemblyscript', 'path': entry})
+
+          print(f"Total discovered extensions: {len(discovered)}")
+          for ext in discovered:
+              print(f"  - {ext['name']} ({ext['type']})")
+
+          # 2. Determine changed files based on trigger event
+          event_name = os.environ.get("GITHUB_EVENT_NAME", "")
+          force_all = os.environ.get("INPUT_FORCE_ALL", "false").lower() == "true"
+          ref = os.environ.get("GITHUB_REF", "")
+          changed_files = set()
+
+          if force_all:
+              print("Manual trigger with force_all=true. Building all extensions.")
+              changed_extensions = discovered
+          else:
+              if event_name == "pull_request":
+                  base_ref = os.environ.get("GITHUB_BASE_REF", "main")
+                  run(f"git fetch origin {base_ref}")
+                  diff_out = run(f"git diff --name-only origin/{base_ref}...HEAD")
+              elif ref.startswith("refs/tags/"):
+                  prev_tag = run("git describe --tags --abbrev=0 HEAD^ 2>/dev/null")
+                  if prev_tag:
+                      print(f"Comparing current tag against previous tag: {prev_tag}")
+                      diff_out = run(f"git diff --name-only {prev_tag} HEAD")
+                  else:
+                      print("No previous tag found. Comparing against HEAD~1.")
+                      diff_out = run("git diff --name-only HEAD~1 HEAD 2>/dev/null") or run("git ls-files")
+              else: # push to branch
+                  before = os.environ.get("BEFORE_SHA", "")
+                  if before and before != "0000000000000000000000000000000000000000":
+                      diff_out = run(f"git diff --name-only {before} HEAD")
+                  else:
+                      diff_out = run("git diff --name-only HEAD~1 HEAD 2>/dev/null") or run("git ls-files")
+
+              changed_files = set(filter(None, diff_out.splitlines()))
+              print(f"Detected {len(changed_files)} changed file(s):")
+              for f in list(changed_files)[:20]:
+                  print(f"  {f}")
+              if len(changed_files) > 20:
+                  print(f"  ...and {len(changed_files) - 20} more")
+
+              changed_extensions = []
+              for ext in discovered:
+                  name = ext['name']
+                  # Match if any changed file is inside the extension dir or is its manifest/wasm file
+                  is_changed = any(
+                      f.startswith(f"{name}/") or
+                      f == f"{name}.json" or
+                      f == f"{name}.wasm"
+                      for f in changed_files
+                  )
+                  if is_changed:
+                      changed_extensions.append(ext)
+
+          has_changes = "true" if len(changed_extensions) > 0 else "false"
+          matrix_json = json.dumps(changed_extensions)
+
+          print(f"Changed extensions to build ({len(changed_extensions)}): {matrix_json}")
+
+          github_output = os.environ.get("GITHUB_OUTPUT", "")
+          if github_output:
+              with open(github_output, "a") as f:
+                  f.write(f"matrix={matrix_json}\n")
+                  f.write(f"has_changes={has_changes}\n")
+          EOF
+        env:
+          GITHUB_EVENT_NAME: ${{ github.event_name }}
+          GITHUB_REF: ${{ github.ref }}
+          GITHUB_BASE_REF: ${{ github.base_ref }}
+          BEFORE_SHA: ${{ github.event.before }}
+          INPUT_FORCE_ALL: ${{ inputs.force_all }}
+
+  # Job 2: Build only the extensions that received updates
   build:
-    name: Build WASI (${{ matrix.extension }})
+    name: Build (${{ matrix.name }})
     needs: discover
-    if: ${{ needs.discover.outputs.matrix != '[]' && needs.discover.outputs.matrix != '' }}
+    if: ${{ needs.discover.outputs.has_changes == 'true' }}
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        extension: ${{ fromJson(needs.discover.outputs.matrix) }}
+        include: ${{ fromJson(needs.discover.outputs.matrix) }}
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Set up Rust toolchain
+      # Toolchain: Rust (for Cargo-based WASI extensions)
+      - name: Setup Rust toolchain
+        if: matrix.type == 'rust'
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: wasm32-wasip1
 
       - name: Rust Cache
+        if: matrix.type == 'rust'
         uses: Swatinem/rust-cache@v2
         with:
-          workspaces: ${{ matrix.extension }}
+          workspaces: ${{ matrix.path }}
 
-      - name: Compile Extension
+      - name: Compile Rust Extension
+        if: matrix.type == 'rust'
         run: |
-          cd ${{ matrix.extension }}
+          cd "${{ matrix.path }}"
           cargo build --release --target wasm32-wasip1
 
-      - name: Package Artifacts
+      # Toolchain: Bun & AssemblyScript (for TypeScript/ASC extensions)
+      - name: Setup Bun
+        if: matrix.type == 'assemblyscript'
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Compile AssemblyScript Extension
+        if: matrix.type == 'assemblyscript'
         run: |
-          # Create clean staging folder and dist directory
-          rm -rf "staging/${{ matrix.extension }}" dist
-          mkdir -p "staging/${{ matrix.extension }}" dist
-          
-          # 1. Copy compiled WASI binary normalized to <extension>.wasm
-          WASM_FILE=$(find "${{ matrix.extension }}/target/wasm32-wasip1/release" -maxdepth 1 -name "*.wasm" | head -n 1)
-          if [ -z "$WASM_FILE" ]; then
-            echo "Error: No compiled .wasm found in ${{ matrix.extension }}/target/wasm32-wasip1/release"
-            exit 1
-          fi
-          cp "$WASM_FILE" "staging/${{ matrix.extension }}/${{ matrix.extension }}.wasm"
-          
-          # 2. Copy manifest JSON
-          if [ -f "${{ matrix.extension }}/manifest.json" ]; then
-            cp "${{ matrix.extension }}/manifest.json" "staging/${{ matrix.extension }}/manifest.json"
-          elif [ -f "${{ matrix.extension }}/${{ matrix.extension }}.json" ]; then
-            cp "${{ matrix.extension }}/${{ matrix.extension }}.json" "staging/${{ matrix.extension }}/${{ matrix.extension }}.json"
-          elif [ -f "${{ matrix.extension }}.json" ]; then
-            cp "${{ matrix.extension }}.json" "staging/${{ matrix.extension }}/${{ matrix.extension }}.json"
+          cd "${{ matrix.path }}"
+          bun install --frozen-lockfile || bun install
+          bun run build
+
+      # Package: .wasm, manifest.json, checksums.txt into <name>.zip
+      - name: Package Extension Bundle
+        run: |
+          mkdir -p "staging/${{ matrix.name }}" dist
+
+          # 1. Locate and copy compiled .wasm
+          if [ "${{ matrix.type }}" = "rust" ]; then
+            WASM_SRC=$(find "${{ matrix.path }}/target/wasm32-wasip1/release" -maxdepth 1 -name "*.wasm" | head -n 1)
           else
-            echo "Error: No JSON manifest found for ${{ matrix.extension }}!"
+            WASM_SRC=$(find "${{ matrix.path }}" -maxdepth 2 -name "*.wasm" | head -n 1)
+          fi
+
+          if [ -z "$WASM_SRC" ] || [ ! -f "$WASM_SRC" ]; then
+            echo "Error: No compiled .wasm found in ${{ matrix.path }}!" >&2
             exit 1
           fi
 
-          # 3. Create bundled zip containing directly the 2 files
-          (cd "staging/${{ matrix.extension }}" && python3 -m zipfile -c "../../dist/${{ matrix.extension }}.zip" *)
+          echo "Found compiled WASM binary: $WASM_SRC"
+          cp "$WASM_SRC" "staging/${{ matrix.name }}/${{ matrix.name }}.wasm"
 
-          echo "Staged files in staging/${{ matrix.extension }}:"
-          ls -la "staging/${{ matrix.extension }}"
-          echo "Files in dist/${{ matrix.extension }}.zip:"
-          python3 -m zipfile -l "dist/${{ matrix.extension }}.zip"
+          # 2. Locate and copy manifest JSON
+          if [ -f "${{ matrix.path }}/manifest.json" ]; then
+            cp "${{ matrix.path }}/manifest.json" "staging/${{ matrix.name }}/manifest.json"
+          elif [ -f "${{ matrix.path }}/${{ matrix.name }}.json" ]; then
+            cp "${{ matrix.path }}/${{ matrix.name }}.json" "staging/${{ matrix.name }}/manifest.json"
+          elif [ -f "${{ matrix.name }}.json" ]; then
+            cp "${{ matrix.name }}.json" "staging/${{ matrix.name }}/manifest.json"
+          else
+            echo "Error: No manifest.json found for ${{ matrix.name }}!" >&2
+            exit 1
+          fi
+          # Also provide <name>.json in the zip for dual compatibility
+          cp "staging/${{ matrix.name }}/manifest.json" "staging/${{ matrix.name }}/${{ matrix.name }}.json"
 
-      # Upload unzipped files so downloading from GitHub Actions UI produces a clean zip with the 2 files
-      - name: Upload Extension Artifact
+          # 3. Compute SHA256 checksums
+          (
+            cd "staging/${{ matrix.name }}"
+            sha256sum "${{ matrix.name }}.wasm" > "${{ matrix.name }}.wasm.sha256"
+            sha256sum "${{ matrix.name }}.wasm" manifest.json > checksums.txt
+          )
+
+          # 4. Create packaged ZIP containing .wasm, manifest, and checksums
+          (
+            cd "staging/${{ matrix.name }}"
+            python3 -m zipfile -c "../../dist/${{ matrix.name }}.zip" *
+          )
+
+          echo "Extension contents for ${{ matrix.name }}.zip:"
+          python3 -m zipfile -l "dist/${{ matrix.name }}.zip"
+
+      - name: Upload Extension Archive
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.extension }}
-          path: staging/${{ matrix.extension }}/*
-          retention-days: 14
-
-      # Upload pre-bundled zip for the release job to publish
-      - name: Upload Release Archive
-        uses: actions/upload-artifact@v4
-        with:
-          name: release-zip-${{ matrix.extension }}
-          path: dist/${{ matrix.extension }}.zip
+          name: release-zip-${{ matrix.name }}
+          path: dist/${{ matrix.name }}.zip
           retention-days: 1
 
-  # Job 3: Publish GitHub Release (runs on pushes to main, tags, and manual workflow_dispatch)
+  # Job 3: Publish GitHub Release and list out latest compiled binaries in a table
   release:
-    name: Publish Release Assets
-    needs: build
+    name: Publish Release & Catalog
+    needs: [discover, build]
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
-      - name: Download all release zips
-        uses: actions/download-artifact@v4
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
         with:
-          pattern: release-zip-*
-          path: release-assets
-          merge-multiple: true
+          python-version: "3.x"
 
       - name: Determine Release Tag
         id: release-info
         run: |
           if [[ "${{ github.ref }}" == refs/tags/* ]]; then
-            echo "tag=${{ github.ref_name }}" >> "$GITHUB_OUTPUT"
-            echo "title=${{ github.ref_name }}" >> "$GITHUB_OUTPUT"
+            TAG="${{ github.ref_name }}"
+            TITLE="${{ github.ref_name }}"
           elif [ -n "${{ inputs.tag_name }}" ]; then
-            echo "tag=${{ inputs.tag_name }}" >> "$GITHUB_OUTPUT"
-            echo "title=${{ inputs.tag_name }}" >> "$GITHUB_OUTPUT"
+            TAG="${{ inputs.tag_name }}"
+            TITLE="${{ inputs.tag_name }}"
           else
-            echo "tag=latest" >> "$GITHUB_OUTPUT"
-            echo "title=Latest Extensions" >> "$GITHUB_OUTPUT"
+            TAG="latest"
+            TITLE="Latest Extensions"
           fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "title=$TITLE" >> "$GITHUB_OUTPUT"
 
-      - name: Create or Update GitHub Release
-        uses: softprops/action-gh-release@v2
+      # Download newly built zips if build job executed
+      - name: Download Newly Built Zips
+        if: ${{ needs.discover.outputs.has_changes == 'true' }}
+        uses: actions/download-artifact@v4
+        with:
+          pattern: release-zip-*
+          path: newly-built-zips
+          merge-multiple: true
+
+      - name: Merge Assets & Generate Release Notes Table
+        id: generate-catalog
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          tag_name: ${{ steps.release-info.outputs.tag }}
-          name: ${{ steps.release-info.outputs.title }}
-          files: release-assets/*.zip
-          draft: false
-          prerelease: false
-          generate_release_notes: true
-          make_latest: true
+          TAG: ${{ steps.release-info.outputs.tag }}
+        run: |
+          mkdir -p existing-assets final-assets newly-built-zips
+
+          # 1. Download existing release assets (preserves unchanged extension binaries)
+          echo "Checking for existing release assets under tag: $TAG"
+          gh release download "$TAG" --pattern "*.zip" --dir existing-assets 2>/dev/null || true
+
+          # 2. Merge assets: existing assets first, then overwrite with newly built
+          if [ -d existing-assets ] && [ "$(ls -A existing-assets 2>/dev/null)" ]; then
+            cp existing-assets/*.zip final-assets/ 2>/dev/null || true
+          fi
+
+          if [ -d newly-built-zips ] && [ "$(ls -A newly-built-zips 2>/dev/null)" ]; then
+            cp newly-built-zips/*.zip final-assets/ 2>/dev/null || true
+          fi
+
+          # 3. Generate Markdown catalog and release notes via Python
+          python3 - << 'EOF'
+          import os, glob, json, zipfile, hashlib
+
+          tag = os.environ.get("TAG", "latest")
+          repo = os.environ.get("GITHUB_REPOSITORY", "")
+          newly_built = set(os.path.basename(p) for p in glob.glob("newly-built-zips/*.zip"))
+          all_zips = sorted(glob.glob("final-assets/*.zip"))
+
+          rows = []
+          for zip_path in all_zips:
+              filename = os.path.basename(zip_path)
+              ext_id = filename.replace(".zip", "")
+              is_updated = filename in newly_built
+
+              name = ext_id
+              version = "latest"
+              capabilities = "-"
+              wasm_size_str = "-"
+              wasm_sha256 = "-"
+
+              try:
+                  with zipfile.ZipFile(zip_path, 'r') as z:
+                      # Extract manifest info
+                      for manifest_name in ['manifest.json', f'{ext_id}.json']:
+                          if manifest_name in z.namelist():
+                              try:
+                                  data = json.loads(z.read(manifest_name).decode('utf-8'))
+                                  name = data.get('name', ext_id)
+                                  version = data.get('version', version)
+                                  caps = data.get('capabilities', [])
+                                  if isinstance(caps, list):
+                                      capabilities = ", ".join(caps)
+                                  break
+                              except Exception:
+                                  pass
+
+                      # Find .wasm file
+                      wasm_files = [n for n in z.namelist() if n.endswith('.wasm')]
+                      if wasm_files:
+                          w_name = wasm_files[0]
+                          w_data = z.read(w_name)
+                          w_size = len(w_data)
+                          if w_size >= 1024 * 1024:
+                              wasm_size_str = f"{w_size / (1024 * 1024):.1f} MB"
+                          else:
+                              wasm_size_str = f"{w_size / 1024:.1f} KB"
+                          wasm_sha256 = hashlib.sha256(w_data).hexdigest()
+              except Exception as e:
+                  print(f"Error inspecting {zip_path}: {e}")
+
+              status = "🟢 Updated" if is_updated else "⚪ Latest"
+              download_url = f"https://github.com/{repo}/releases/download/{tag}/{filename}"
+              short_sha = f"`{wasm_sha256[:12]}...`" if len(wasm_sha256) > 12 else wasm_sha256
+
+              rows.append({
+                  "id": ext_id,
+                  "name": name,
+                  "version": version,
+                  "capabilities": capabilities,
+                  "size": wasm_size_str,
+                  "sha256": short_sha,
+                  "full_sha256": wasm_sha256,
+                  "download": f"[`{filename}`]({download_url})",
+                  "status": status
+              })
+
+          # Construct Markdown
+          lines = []
+          lines.append(f"## Lyria Extensions ({tag})")
+          lines.append("")
+          lines.append("Algorithmically-driven, sandboxed WebAssembly extensions for the Lyria Music Player.")
+          lines.append("")
+          lines.append("### Compiled Extension Packages")
+          lines.append("")
+          lines.append("| Extension | Version | Capabilities | Binary Size | SHA-256 Checksum | Download | Status |")
+          lines.append("| :--- | :---: | :---: | :---: | :---: | :---: | :---: |")
+
+          for r in rows:
+              lines.append(f"| **{r['name']}** (`{r['id']}`) | `{r['version']}` | `{r['capabilities']}` | `{r['size']}` | {r['sha256']} | {r['download']} | {r['status']} |")
+
+          lines.append("")
+          lines.append("> **Package Structure:**")
+          lines.append("> Each `.zip` bundle contains the compiled `.wasm` binary, the `manifest.json` schema, and `checksums.txt`.")
+          lines.append("")
+          lines.append("<details><summary><strong>Full SHA-256 Checksums</strong></summary>")
+          lines.append("")
+          lines.append("```")
+          for r in rows:
+              lines.append(f"{r['full_sha256']}  {r['id']}.wasm")
+          lines.append("```")
+          lines.append("</details>")
+
+          with open("RELEASE_NOTES.md", "w") as f:
+              f.write("\n".join(lines))
+          EOF
+
+          echo "Generated RELEASE_NOTES.md:"
+          cat RELEASE_NOTES.md
+
+      - name: Publish or Update GitHub Release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.release-info.outputs.tag }}
+          TITLE: ${{ steps.release-info.outputs.title }}
+        run: |
+          if [ ! -d final-assets ] || [ -z "$(ls -A final-assets/*.zip 2>/dev/null)" ]; then
+            echo "No extension archives to release. Skipping release creation."
+            exit 0
+          fi
+
+          IS_LATEST="false"
+          if [ "$TAG" = "latest" ]; then
+            IS_LATEST="true"
+          fi
+
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG exists. Updating release description and assets..."
+            gh release edit "$TAG" --title "$TITLE" --notes-file RELEASE_NOTES.md --latest="$IS_LATEST"
+            gh release upload "$TAG" final-assets/*.zip --clobber
+          else
+            echo "Creating new release $TAG..."
+            gh release create "$TAG" final-assets/*.zip --title "$TITLE" --notes-file RELEASE_NOTES.md --latest="$IS_LATEST"
+          fi

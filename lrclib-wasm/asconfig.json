@@ -1,0 +1,14 @@
+{
+  "targets": {
+    "release": {
+      "outFile": "lrclib.wasm",
+      "optimize": true,
+      "shrinkLevel": 2,
+      "converge": true,
+      "noAssert": true
+    }
+  },
+  "options": {
+    "bindings": "raw"
+  }
+}
