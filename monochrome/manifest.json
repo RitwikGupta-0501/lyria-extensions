@@ -1,0 +1,9 @@
+{
+  "id": "monochrome",
+  "name": "Monochrome (FLAC)",
+  "author": "Lyria Community",
+  "version": "1.0.0",
+  "description": "High-fidelity lossless FLAC downloads via Monochrome API",
+  "main": "monochrome.wasm",
+  "capabilities": ["download", "search"]
+}

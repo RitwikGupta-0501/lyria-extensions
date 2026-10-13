@@ -112,6 +112,27 @@ export function get_lyrics(): i32 {
     return 0;
   }
 
+  const trackIdVal = query.getString("track_id");
+  if (trackIdVal && trackIdVal.valueOf().length > 0) {
+    const idUrl = "https://lrclib.net/api/get/" + trackIdVal.valueOf();
+    const idBody = httpGet(idUrl);
+    if (idBody && idBody.length > 0) {
+      const data = <JSON.Obj>(JSON.parse(idBody));
+      if (data) {
+        const synced = data.getString("syncedLyrics");
+        if (synced && synced.valueOf().length > 0) {
+          Host.outputString(synced.valueOf());
+          return 0;
+        }
+        const plain = data.getString("plainLyrics");
+        if (plain && plain.valueOf().length > 0) {
+          Host.outputString(plain.valueOf());
+          return 0;
+        }
+      }
+    }
+  }
+
   const titleVal = query.getString("title");
   const artistVal = query.getString("artist");
   const albumVal = query.getString("album");
@@ -195,3 +216,122 @@ export function get_lyrics(): i32 {
   Host.outputString("");
   return 0;
 }
+
+/**
+ * Exported Extism Hook: search_lyrics
+ * 
+ * Input: Search query string (raw or JSON with { query: string })
+ * Output: JSON array of LyricsSearchResultItem
+ */
+export function search_lyrics(): i32 {
+  const rawInput = Host.inputString();
+  if (rawInput.length == 0) {
+    Host.outputString("[]");
+    return 0;
+  }
+
+  let searchTerm = rawInput.trim();
+  if (searchTerm.startsWith("{")) {
+    const parsed = <JSON.Obj>(JSON.parse(searchTerm));
+    if (parsed) {
+      const qVal = parsed.getString("query");
+      if (qVal) {
+        searchTerm = qVal.valueOf().trim();
+      }
+    }
+  }
+
+  if (searchTerm.length == 0) {
+    Host.outputString("[]");
+    return 0;
+  }
+
+  log("Searching LRCLIB candidates for: " + searchTerm);
+  const searchUrl = "https://lrclib.net/api/search?q=" + urlEncode(searchTerm);
+  const searchBody = httpGet(searchUrl);
+  if (!searchBody || searchBody.length == 0) {
+    Host.outputString("[]");
+    return 0;
+  }
+
+  const rawArr = <JSON.Arr>(JSON.parse(searchBody));
+  if (!rawArr || rawArr._arr.length == 0) {
+    Host.outputString("[]");
+    return 0;
+  }
+
+  const outArr = new JSON.Arr();
+  const count = rawArr._arr.length > 10 ? 10 : rawArr._arr.length;
+
+  for (let i = 0; i < count; i++) {
+    const item = <JSON.Obj>(rawArr._arr[i]);
+    if (!item) continue;
+
+    const idVal = item.getInteger("id");
+    const trackNameVal = item.getString("trackName");
+    const nameVal = item.getString("name");
+    const artistVal = item.getString("artistName");
+    const albumVal = item.getString("albumName");
+    const durVal = item.getFloat("duration");
+    const durInt = item.getInteger("duration");
+    const syncedVal = item.getString("syncedLyrics");
+    const plainVal = item.getString("plainLyrics");
+
+    const titleStr = trackNameVal ? trackNameVal.valueOf() : (nameVal ? nameVal.valueOf() : "");
+    const artistStr = artistVal ? artistVal.valueOf() : "Unknown";
+    const idStr = idVal ? idVal.valueOf().toString() : i.toString();
+
+    const hasSynced: bool = syncedVal != null && syncedVal.valueOf().length > 0;
+    const hasPlain: bool = plainVal != null && plainVal.valueOf().length > 0;
+    if (!hasSynced && !hasPlain) {
+      continue;
+    }
+
+    let durMs: i64 = 0;
+    if (durVal) {
+      durMs = <i64>(durVal.valueOf() * 1000.0);
+    } else if (durInt) {
+      durMs = durInt.valueOf() * 1000;
+    }
+
+    const resObj = new JSON.Obj();
+    resObj.set("id", idStr);
+    resObj.set("title", titleStr);
+    resObj.set("artist", artistStr);
+    if (albumVal && albumVal.valueOf().length > 0) {
+      resObj.set("album", albumVal.valueOf());
+    }
+    if (durMs > 0) {
+      resObj.set("duration_ms", durMs);
+    }
+    resObj.set("format", hasSynced ? "synced" : "plain");
+    resObj.set("provider_id", "lrclib-wasm.wasm");
+    resObj.set("provider_name", "LRCLIB");
+
+    let preview = "";
+    if (hasSynced) {
+      const syncStr = (<JSON.Str>syncedVal).valueOf();
+      const firstLineEnd = syncStr.indexOf("\n");
+      const firstLine = firstLineEnd > 0 ? syncStr.slice(0, firstLineEnd) : syncStr;
+      const bracketEnd = firstLine.indexOf("]");
+      if (bracketEnd >= 0 && bracketEnd + 1 < firstLine.length) {
+        preview = firstLine.slice(bracketEnd + 1).trim();
+      } else {
+        preview = firstLine.trim();
+      }
+    } else if (hasPlain) {
+      const plainStr = (<JSON.Str>plainVal).valueOf();
+      const firstLineEnd = plainStr.indexOf("\n");
+      preview = (firstLineEnd > 0 ? plainStr.slice(0, firstLineEnd) : plainStr).trim();
+    }
+    if (preview.length > 0) {
+      resObj.set("preview_text", preview);
+    }
+
+    outArr.push(resObj);
+  }
+
+  Host.outputString(outArr.stringify());
+  return 0;
+}
+

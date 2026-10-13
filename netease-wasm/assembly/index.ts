@@ -113,6 +113,26 @@ export function get_lyrics(): i32 {
     return 0;
   }
 
+  const trackIdVal = query.getString("track_id");
+  if (trackIdVal && trackIdVal.valueOf().length > 0) {
+    const lyricUrl = "https://music.163.com/api/song/lyric?id=" + trackIdVal.valueOf() + "&lv=1&kv=1&tv=-1";
+    const lyricBody = httpGet(lyricUrl);
+    if (lyricBody && lyricBody.length > 0) {
+      const lyricJson = <JSON.Obj>(JSON.parse(lyricBody));
+      if (lyricJson) {
+        const lrcObj = lyricJson.getObj("lrc");
+        if (lrcObj) {
+          const lrcStr = lrcObj.getString("lyric");
+          if (lrcStr && lrcStr.valueOf().trim().length > 0) {
+            log("Retrieved lyrics for direct track ID " + trackIdVal.valueOf());
+            Host.outputString(lrcStr.valueOf());
+            return 0;
+          }
+        }
+      }
+    }
+  }
+
   const titleVal = query.getString("title");
   const artistVal = query.getString("artist");
   const durationVal = query.getInteger("duration_ms");
@@ -268,3 +288,117 @@ export function get_lyrics(): i32 {
   Host.outputString("");
   return 0;
 }
+
+/**
+ * Exported Extism Hook: search_lyrics
+ * 
+ * Input: Search query string (raw or JSON with { query: string })
+ * Output: JSON array of LyricsSearchResultItem
+ */
+export function search_lyrics(): i32 {
+  const rawInput = Host.inputString();
+  if (rawInput.length == 0) {
+    Host.outputString("[]");
+    return 0;
+  }
+
+  let searchTerm = rawInput.trim();
+  if (searchTerm.startsWith("{")) {
+    const parsed = <JSON.Obj>(JSON.parse(searchTerm));
+    if (parsed) {
+      const qVal = parsed.getString("query");
+      if (qVal) {
+        searchTerm = qVal.valueOf().trim();
+      }
+    }
+  }
+
+  if (searchTerm.length == 0) {
+    Host.outputString("[]");
+    return 0;
+  }
+
+  log("Searching NetEase candidates for: " + searchTerm);
+  const suggestUrl = "https://music.163.com/api/search/suggest/web?s=" + urlEncode(searchTerm) + "&limit=10";
+  const body = httpGet(suggestUrl);
+  if (!body || body.length == 0) {
+    Host.outputString("[]");
+    return 0;
+  }
+
+  const parsed = <JSON.Obj>(JSON.parse(body));
+  if (!parsed) {
+    Host.outputString("[]");
+    return 0;
+  }
+
+  const resultObj = parsed.getObj("result");
+  if (!resultObj) {
+    Host.outputString("[]");
+    return 0;
+  }
+
+  const songsArr = resultObj.getArr("songs");
+  if (!songsArr || songsArr._arr.length == 0) {
+    Host.outputString("[]");
+    return 0;
+  }
+
+  const outArr = new JSON.Arr();
+  const count = songsArr._arr.length > 10 ? 10 : songsArr._arr.length;
+
+  for (let i = 0; i < count; i++) {
+    const songObj = <JSON.Obj>(songsArr._arr[i]);
+    if (!songObj) continue;
+
+    const idVal = songObj.getInteger("id");
+    if (!idVal) continue;
+    const songIdStr = idVal.valueOf().toString();
+
+    const nameVal = songObj.getString("name");
+    const songName = nameVal ? nameVal.valueOf() : "Unknown Title";
+
+    let artistName = "Unknown Artist";
+    const artistsArr = songObj.getArr("artists");
+    if (artistsArr && artistsArr._arr.length > 0) {
+      const firstArtist = <JSON.Obj>(artistsArr._arr[0]);
+      if (firstArtist) {
+        const aName = firstArtist.getString("name");
+        if (aName) artistName = aName.valueOf();
+      }
+    }
+
+    let albumName = "";
+    const albumObj = songObj.getObj("album");
+    if (albumObj) {
+      const alName = albumObj.getString("name");
+      if (alName) albumName = alName.valueOf();
+    }
+
+    let durMs: i64 = 0;
+    const durVal = songObj.getInteger("duration");
+    if (durVal) {
+      durMs = durVal.valueOf();
+    }
+
+    const resObj = new JSON.Obj();
+    resObj.set("id", songIdStr);
+    resObj.set("title", songName);
+    resObj.set("artist", artistName);
+    if (albumName.length > 0) {
+      resObj.set("album", albumName);
+    }
+    if (durMs > 0) {
+      resObj.set("duration_ms", durMs);
+    }
+    resObj.set("format", "synced");
+    resObj.set("provider_id", "netease-wasm.wasm");
+    resObj.set("provider_name", "NetEase");
+
+    outArr.push(resObj);
+  }
+
+  Host.outputString(outArr.stringify());
+  return 0;
+}
+
