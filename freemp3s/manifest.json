@@ -1,0 +1,9 @@
+{
+  "id": "freemp3s",
+  "name": "FreeMP3s (yt2api)",
+  "author": "Lyria Community",
+  "version": "1.0.0",
+  "description": "MP3 audio converter and download provider via yt2api",
+  "main": "freemp3s.wasm",
+  "capabilities": ["download"]
+}
